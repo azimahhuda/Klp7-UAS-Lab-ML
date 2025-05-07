@@ -1,0 +1,408 @@
+import streamlit as st
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
+import numpy as np
+from PIL import Image
+import os
+import pandas as pd
+import plotly.express as px
+import time
+
+# --- Konfigurasi Halaman ---
+st.set_page_config(
+    page_title="Klasifikasi Gambar Intel",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- CSS Kustom ---
+def tambahkan_style():
+    """Menambahkan style CSS kustom ke aplikasi Streamlit"""
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{
+            background-color: #f7f9fc;
+            background-attachment: fixed;
+            background-size: cover;
+        }}
+        .stButton>button {{
+            background-color: #95c8d8;
+            color: #333;
+            border-radius: 8px;
+            padding: 10px 25px;
+            font-weight: bold;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+            transition: all 0.2s;
+        }}
+        .stButton>button:hover {{
+            transform: translateY(-1px);
+            box-shadow: 0 3px 5px rgba(0, 0, 0, 0.1);
+            background-color: #aed9e6;
+        }}
+        .prediction-card {{
+            background-color: #ffffff;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+            border: 1px solid #e6e9f0;
+        }}
+        .title-container {{
+            background-color: #ffffff;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.03);
+            border: 1px solid #e6e9f0;
+        }}
+        .stDataFrame {{
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 10px;
+            border: 1px solid #e6e9f0;
+        }}
+        .stAlert {{
+            border-radius: 8px;
+        }}
+        .footer {{
+            position: fixed;
+            bottom: 0;
+            width: 100%;
+            text-align: center;
+            padding: 5px;
+            background-color: #ffffff;
+            border-top: 1px solid #e6e9f0;
+            font-size: 12px;
+        }}
+        .container-wrapper {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 10px 20px;
+        }}
+        h1, h2, h3 {{
+            color: #4a6fa5;
+        }}
+        .warning-indicator {{
+            color: #e67e22;
+            font-weight: bold;
+            padding: 3px 8px;
+            border-radius: 4px;
+            background-color: #fff3e0;
+            display: inline-block;
+            margin-left: 8px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+tambahkan_style()
+
+# --- Konfigurasi Model ---
+MODEL_PATH = 'model_intel_best.keras'  # Path ke model terlatih
+IMG_HEIGHT = 150  # Tinggi gambar yang dibutuhkan model
+IMG_WIDTH = 150   # Lebar gambar yang dibutuhkan model
+CLASS_NAMES = ['buildings', 'forest', 'sea']  # Nama kelas/kategori
+CLASS_ICONS = {
+    'buildings': '🏢',
+    'forest': '🌿',
+    'sea': '🌊'
+}
+
+# --- Konfigurasi Deteksi Gambar Di Luar Kategori ---
+# Ambang batas minimum untuk kepercayaan prediksi
+MIN_CONFIDENCE_THRESHOLD = 45.0  # dalam persen
+# Ambang batas untuk distribusi yang merata/tidak jelas
+DISTRIBUTION_EVENNESS_THRESHOLD = 20.0  # dalam persen
+
+# --- Fungsi Bantuan ---
+@st.cache_resource
+def load_model_cache():
+    """
+    Memuat model Keras dari path yang ditentukan dengan caching Streamlit.
+    Returns:
+        model: Model TensorFlow yang telah dimuat
+    """
+    try:
+        with st.spinner("Memuat model... Mohon tunggu"):
+            model = load_model(MODEL_PATH)
+            print("Model berhasil dimuat.")
+            return model
+    except Exception as e:
+        st.error(f"Error saat memuat model dari {MODEL_PATH}: {e}")
+        print(f"Error saat memuat model: {e}")
+        return None
+
+def preprocess_image(image_pil):
+    """
+    Melakukan preprocessing pada gambar PIL sesuai kebutuhan model.
+    
+    Args:
+        image_pil: Gambar dalam format PIL Image
+        
+    Returns:
+        image_array: Gambar yang telah diproses dalam format numpy array
+    """
+    # Pastikan gambar selalu dalam format RGB (3 channel)
+    if image_pil.mode != 'RGB':
+        st.warning(f"Gambar terdeteksi bukan RGB (mode: {image_pil.mode}). Mengonversi ke RGB...")
+        image_pil = image_pil.convert('RGB')
+
+    # Resize gambar ke dimensi yang dibutuhkan model
+    image_pil = image_pil.resize((IMG_HEIGHT, IMG_WIDTH), Image.Resampling.LANCZOS)
+    
+    # Konversi ke array numpy
+    image_array = img_to_array(image_pil)
+    
+    # Rescale (normalisasi) nilai pixel ke rentang 0-1
+    image_array = image_array / 255.0
+    
+    # Tambahkan dimensi batch (model mengharapkan batch gambar)
+    image_array = np.expand_dims(image_array, axis=0)
+    
+    return image_array
+
+def is_uncertain_prediction(prediction, threshold=MIN_CONFIDENCE_THRESHOLD, evenness_threshold=DISTRIBUTION_EVENNESS_THRESHOLD):
+    """
+    Memeriksa apakah prediksi menunjukkan ketidakpastian yang tinggi,
+    mengindikasikan gambar mungkin di luar kategori yang dilatih.
+    
+    Args:
+        prediction: Array probabilitas untuk setiap kelas
+        threshold: Ambang batas kepercayaan minimum (dalam persen)
+        evenness_threshold: Ambang batas untuk distribusi yang merata (dalam persen)
+    
+    Returns:
+        bool: True jika prediksi tidak pasti, False jika tidak
+    """
+    # Konversi ke persen untuk kemudahan
+    probs = prediction[0] * 100
+    
+    # Cek jika probabilitas tertinggi di bawah ambang batas
+    max_prob = np.max(probs)
+    if max_prob < threshold:
+        return True
+    
+    # Cek keseragaman distribusi (jika semua kelas memiliki probabilitas yang hampir sama)
+    # Hitung selisih antara probabilitas tertinggi dan terendah
+    prob_range = np.max(probs) - np.min(probs)
+    if prob_range < evenness_threshold:
+        return True
+    
+    # Cek jika beberapa kelas memiliki probabilitas yang hampir sama dengan yang tertinggi
+    competitors = np.sum(probs > (max_prob - evenness_threshold))
+    if competitors > 1:
+        return True
+    
+    return False
+
+# --- Memuat Model ---
+model = load_model_cache()
+
+# --- Sidebar ---
+with st.sidebar:
+    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/5/51/Intel_logo_%282020%2C_light_blue%29.svg/1200px-Intel_logo_%282020%2C_light_blue%29.svg.png", width=150)
+    
+    st.markdown("""
+    <div style="background-color: #f5f7fa; padding: 10px; border-radius: 8px; margin-top: 10px;">
+        <h4 style="margin-top: 0; color: #4a6fa5;">Tentang Aplikasi</h4>
+        <p style="font-size: 0.9em;">Aplikasi ini mengklasifikasikan gambar dari Intel Image Dataset ke dalam tiga kategori pemandangan.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Informasi kategori dalam format yang lebih rapi
+    st.markdown("""
+    <div style="background-color: #f5f7fa; padding: 10px; border-radius: 8px; margin-top: 15px;">
+        <h4 style="margin-top: 0; color: #4a6fa5;">Kategori</h4>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <td style="padding: 5px;">🏢 Bangunan</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;">🌿 Hutan</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;">🌊 Laut</td>
+            </tr>
+        </table>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Detail model dalam format yang lebih rapi
+    st.markdown("""
+    <div style="background-color: #f5f7fa; padding: 10px; border-radius: 8px; margin-top: 15px;">
+        <h4 style="margin-top: 0; color: #4a6fa5;">Informasi Model</h4>
+        <table style="width: 100%; border-collapse: collapse; font-size: 0.9em;">
+            <tr>
+                <td style="padding: 3px;">Arsitektur</td>
+                <td style="padding: 3px;">CNN</td>
+            </tr>
+            <tr>
+                <td style="padding: 3px;">Ukuran input</td>
+                <td style="padding: 3px;">150 × 150 px</td>
+            </tr>
+            <tr>
+                <td style="padding: 3px;">Jumlah kelas</td>
+                <td style="padding: 3px;">3</td>
+            </tr>
+        </table>
+    </div>
+    """, unsafe_allow_html=True)
+
+# --- Konten Utama ---
+st.markdown("<div class='container-wrapper'>", unsafe_allow_html=True)
+st.markdown("<div class='title-container'><h1>Klasifikasi Gambar Intel</h1><p>Unggah gambar pemandangan untuk diklasifikasikan sebagai bangunan, hutan, atau laut</p></div>", unsafe_allow_html=True)
+
+# Pengaturan layout untuk pengunggahan file
+uploaded_file = st.file_uploader("Pilih sebuah gambar...", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+
+if uploaded_file is not None:
+    # Membuat layout 2 kolom untuk gambar dan hasil prediksi
+    col1, col2 = st.columns([1, 1], gap="medium")
+    
+    with col1:
+        st.markdown("#### Gambar yang Diunggah")
+        image = Image.open(uploaded_file)
+        st.image(image, caption='', use_column_width=True)
+
+if uploaded_file is not None and model is not None:
+    classify_btn = st.button('Klasifikasikan Gambar', use_container_width=True)
+    
+    if classify_btn:
+        with st.spinner('Memproses gambar...'):
+            # Tambahkan progress bar untuk visual feedback
+            progress_bar = st.progress(0)
+            for percent_complete in range(100):
+                time.sleep(0.01)  # Simulasi waktu pemrosesan
+                progress_bar.progress(percent_complete + 1)
+            
+            # Preprocess gambar dan lakukan prediksi
+            processed_image = preprocess_image(image)
+            prediction = model.predict(processed_image)
+            predicted_class_index = np.argmax(prediction[0])
+            confidence_score = np.max(prediction[0]) * 100
+            
+            # Periksa apakah prediksi tidak pasti (gambar mungkin di luar kategori)
+            is_uncertain = is_uncertain_prediction(prediction)
+            
+            # Tampilkan hasil di kolom kedua
+            with col2:
+                st.markdown("<div class='prediction-card'>", unsafe_allow_html=True)
+                if predicted_class_index < len(CLASS_NAMES):
+                    predicted_class_name = CLASS_NAMES[predicted_class_index]
+                    st.markdown("#### Hasil Prediksi")
+                    
+                    if is_uncertain:
+                        st.markdown(f"""
+                        <h3 style='text-align: center; margin-top: 10px;'>
+                            {CLASS_ICONS[predicted_class_name]} {predicted_class_name.capitalize()}
+                            <span class='warning-indicator'>⚠️ Di luar kategori</span>
+                        </h3>
+                        <p style='text-align: center; color: #e67e22; font-size: 0.85em;'>
+                            Gambar ini mungkin tidak termasuk dalam kategori bangunan, hutan, atau laut.
+                        </p>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<h3 style='text-align: center; margin-top: 10px;'>{CLASS_ICONS[predicted_class_name]} {predicted_class_name.capitalize()}</h3>", unsafe_allow_html=True)
+                    
+                    # Tampilkan tingkat kepercayaan dengan colored progress bar
+                    st.markdown("#### Tingkat Kepercayaan")
+                    
+                    # Indikator kepercayaan dengan kode warna pastel
+                    if confidence_score > 90:
+                        confidence_color = "#a8d5ba"  # pastel hijau
+                    elif confidence_score > 70:
+                        confidence_color = "#f9d5a7"  # pastel oranye
+                    else:
+                        confidence_color = "#f8b6b6"  # pastel merah
+                        
+                    st.markdown(f"""
+                    <div style="border-radius: 8px; background-color: #f5f7fa; padding: 3px; margin: 10px 0;">
+                        <div style="width: {confidence_score}%; height: 18px; background-color: {confidence_color}; 
+                        border-radius: 8px; text-align: center; color: #333; font-weight: medium;">
+                            {confidence_score:.1f}%
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.error("Indeks kelas prediksi di luar jangkauan.")
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Buat container baru untuk distribusi probabilitas
+            st.markdown("<div class='prediction-card' style='margin-top: 20px;'>", unsafe_allow_html=True)
+            st.markdown("#### Distribusi Probabilitas")
+            
+            # Tampilkan probabilitas sebagai grafik batang dengan warna pastel
+            prob_data = pd.DataFrame({
+                'Kelas': [kelas.capitalize() for kelas in CLASS_NAMES],
+                'Probabilitas': prediction[0] * 100
+            })
+            
+            fig = px.bar(prob_data, x='Kelas', y='Probabilitas', 
+                         color='Kelas', 
+                         color_discrete_sequence=["#aec6cf", "#b5e7a0", "#d6cdea"],  # warna pastel
+                         text=prob_data['Probabilitas'].apply(lambda x: f"{x:.2f}%"))
+            
+            fig.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                height=300,
+                margin=dict(l=20, r=20, t=30, b=20)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Tampilkan juga sebagai dataframe untuk kejelasan
+            with st.expander("Lihat Detail", expanded=False):
+                prob_df = pd.DataFrame({
+                    'Kelas': [kelas.capitalize() for kelas in CLASS_NAMES],
+                    'Probabilitas': [f"{x*100:.2f}%" for x in prediction[0]]
+                })
+                st.dataframe(prob_df, use_container_width=True, hide_index=True)
+            
+            # Tambahkan penjelasan tentang deteksi gambar di luar kategori
+            if is_uncertain:
+                st.markdown("""
+                <div style="background-color: #fff3e0; padding: 10px; border-radius: 8px; border-left: 3px solid #e67e22; margin-top: 15px;">
+                    <h5 style="color: #e67e22; margin-top: 0;">⚠️ Gambar Di Luar Kategori Terdeteksi</h5>
+                    <p style="font-size: 0.9em; margin-bottom: 5px;">
+                        Model mendeteksi bahwa gambar ini mungkin tidak termasuk dalam kategori bangunan, hutan, atau laut.
+                        Hal ini terindikasi dari:
+                    </p>
+                    <ul style="font-size: 0.9em; margin-bottom: 0;">
+                        <li>Tingkat kepercayaan yang rendah, atau</li>
+                        <li>Distribusi probabilitas yang hampir merata di antara ketiga kategori</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+                
+            st.markdown("</div>", unsafe_allow_html=True)
+
+elif uploaded_file is None:
+    # Membuat tampilan kosong yang lebih elegan
+    st.markdown("""
+    <div style="background-color: #f5f7fa; padding: 30px; border-radius: 8px; text-align: center; margin-top: 30px;">
+        <svg width="50" height="50" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M4 16L8.58579 11.4142C9.36683 10.6332 10.6332 10.6332 11.4142 11.4142L16 16M14 14L15.5858 12.4142C16.3668 11.6332 17.6332 11.6332 18.4142 12.4142L20 14M14 8H14.01M6 20H18C19.1046 20 20 19.1046 20 18V6C20 4.89543 19.1046 4 18 4H6C4.89543 4 4 4.89543 4 6V18C4 19.1046 4.89543 20 6 20Z" stroke="#95c8d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <p style="margin-top: 15px; color: #4a6fa5;">Silakan unggah berkas gambar untuk memulai klasifikasi</p>
+    </div>
+    """, unsafe_allow_html=True)
+elif model is None:
+    st.error("Model tidak dapat dimuat. Silakan periksa path model dan coba lagi.")
+
+# Akhiri container wrapper
+st.markdown("</div>", unsafe_allow_html=True)
+
+# Footer
+st.markdown("""
+<div class="footer">
+    Aplikasi Klasifikasi Gambar Intel © 2025
+</div>
+""", unsafe_allow_html=True)
+
+# Perintah untuk menjalankan aplikasi:
+# streamlit run depmodel.py
