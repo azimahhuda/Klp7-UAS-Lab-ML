@@ -84,15 +84,6 @@ Sebelum menjalankan aplikasi, pastikan Anda telah menginstal perangkat lunak dan
 4. Lihat hasil klasifikasi dan distribusi probabilitas yang ditampilkan.
 5. Tekan tombol "Lihat Detail" untuk melihat informasi probabilitas yang lebih detail.
 
-## Struktur File
-
-
-klasifikasi-gambar-intel/
-├── depmodel.py         # File utama aplikasi Streamlit
-├── model_intel_best.keras  # Model terlatih
-├── requirements.txt    # Daftar dependensi
-└── README.md           # Dokumentasi proyek
-
 
 ## File Requirements.txt
 
